@@ -7,8 +7,6 @@ import time
 import json
 import copy
 import logging
-import signal
-import subprocess
 import feedparser
 import requests
 import datetime
@@ -18,18 +16,6 @@ import gc  # 添加gc库用于主动垃圾回收
 import psutil  # 添加psutil库用于监控内存使用
 from logging.handlers import RotatingFileHandler
 from threading import Thread
-
-# Windows兼容性处理
-try:
-    import readline
-except ImportError:
-    pass
-
-try:
-    import resource  # Unix/Linux系统资源限制
-except ImportError:
-    # Windows系统不支持resource模块
-    resource = None
 
 # 配置文件和日志文件路径（Windows兼容）
 if os.name == 'nt':  # Windows系统
@@ -145,8 +131,30 @@ def load_config():
             if 'chat_id' not in config['telegram']:
                 config['telegram']['chat_id'] = ''
     
-    # 关键字列表标准化：去空白、小写去重但保留原形
-    def normalize_kw_list(lst):
+    # --- 关键字结构迁移逻辑 Start ---
+    # 将旧版 ["kw1", "kw2"] 转换为 [{"word": "kw1", "include": [], "exclude": []}, ...]
+    new_keywords = []
+    if isinstance(config['keywords'], list):
+        for item in config['keywords']:
+            if isinstance(item, str):
+                # 旧格式：转换为新对象
+                new_keywords.append({
+                    "word": item.strip(),
+                    "include": [],
+                    "exclude": []
+                })
+            elif isinstance(item, dict) and 'word' in item:
+                # 新格式：保持原样，确保字段完整
+                if 'include' not in item:
+                    item['include'] = []
+                if 'exclude' not in item:
+                    item['exclude'] = []
+                new_keywords.append(item)
+    config['keywords'] = new_keywords
+    # --- 关键字结构迁移逻辑 End ---
+
+    # 全局排除关键词列表标准化（保持旧逻辑，仅针对exclude_keywords）
+    def normalize_str_list(lst):
         cleaned = []
         seen = set()
         for kw in lst:
@@ -162,8 +170,7 @@ def load_config():
             cleaned.append(kw_clean)
         return cleaned
     
-    config['keywords'] = normalize_kw_list(config.get('keywords', []))
-    config['exclude_keywords'] = normalize_kw_list(config.get('exclude_keywords', []))
+    config['exclude_keywords'] = normalize_str_list(config.get('exclude_keywords', []))
     
     return config
 
@@ -211,6 +218,8 @@ def save_config(config):
                 # 保留基本配置和历史通知记录，只清理非关键数据
                 basic_config = {
                     'keywords': config.get('keywords', []),
+                    'exclude_keywords': config.get('exclude_keywords', []),
+                    'settings': config.get('settings', {}),
                     'telegram': config.get('telegram', {'bot_token': '', 'chat_id': ''}),
                     'notified_entries': config.get('notified_entries', {}),  # 必须保留历史记录！
                 }
@@ -323,18 +332,16 @@ def disable_telegram_webhook(bot_token):
 def set_telegram_bot_commands(bot_token):
     """设置机器人菜单命令，方便在Telegram中查看"""
     commands = [
-        {"command": "add", "description": "添加关键词 /add 关键字"},
+        {"command": "add", "description": "增加/更新 /add mk clean +卖 -吗"},
         {"command": "del", "description": "删除关键词 /del 关键字"},
         {"command": "list", "description": "查看关键词列表"},
-        {"command": "block", "description": "添加排除关键词 /block 关键字"},
-        {"command": "unblock", "description": "删除排除关键词 /unblock 关键字"},
-        {"command": "blocklist", "description": "查看排除关键词列表"},
+        {"command": "block", "description": "全局屏蔽 /block 关键字"},
+        {"command": "unblock", "description": "取消全局屏蔽 /unblock 关键字"},
+        {"command": "blocklist", "description": "查看全局屏蔽列表"},
         {"command": "status", "description": "查看运行状态"},
-        {"command": "setinterval", "description": "设置检测间隔 /setinterval 30 60"},
-        {"command": "setnotifylimit", "description": "设置通知去重上限"},
-        {"command": "setsummary", "description": "摘要匹配开关 on/off"},
-        {"command": "setfullword", "description": "完整词匹配开关 on/off"},
-        {"command": "setregex", "description": "正则匹配开关 on/off"},
+        {"command": "setinterval", "description": "设置检测间隔 /setinterval 30"},
+        {"command": "setnotifylimit", "description": "设置通知记录上限"},
+        {"command": "setsummary", "description": "匹配摘要 on/off"},
         {"command": "help", "description": "查看帮助"},
     ]
     try:
@@ -380,21 +387,20 @@ def check_rss_feed(config):
     """检查RSS源并匹配关键词"""
     global last_rss_check_time, last_rss_error
     # 确保config字典包含必要的键
-    if 'keywords' not in config or not isinstance(config['keywords'], list):
+    if 'keywords' not in config:
         config['keywords'] = []
-    if 'exclude_keywords' not in config or not isinstance(config['exclude_keywords'], list):
+    if 'exclude_keywords' not in config:
         config['exclude_keywords'] = []
     if 'settings' not in config or not isinstance(config['settings'], dict):
         config['settings'] = copy.deepcopy(DEFAULT_CONFIG['settings'])
-    else:
-        for k, v in DEFAULT_CONFIG['settings'].items():
-            if k not in config['settings']:
-                config['settings'][k] = v
+    
     if 'notified_entries' not in config or not isinstance(config['notified_entries'], dict):
         config['notified_entries'] = {}
+        
     if not config['keywords']:
         logger.warning("没有设置关键词，跳过检查")
         return
+        
     max_retries = 3
     retry_delay = 10
     config_changed = False
@@ -404,25 +410,26 @@ def check_rss_feed(config):
             headers = {
                 'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
             }
+            # 使用 NodeSeek 官方 RSS
             response = requests.get("https://rss.nodeseek.com/", headers=headers, timeout=30)
             if response.status_code != 200:
                 logger.error(f"获取RSS失败，HTTP状态码: {response.status_code}")
                 if attempt < max_retries - 1:
                     current_retry_delay = retry_delay * (attempt + 1)
-                    logger.info(f"将在{current_retry_delay}秒后重试 ({attempt+1}/{max_retries})")
                     time.sleep(current_retry_delay)
                     continue
                 return
+                
             logger.info("开始解析RSS内容...")
             feed = feedparser.parse(response.content)
             if not hasattr(feed, 'entries') or not feed.entries:
                 logger.error("RSS解析失败或没有找到条目")
                 if attempt < max_retries - 1:
                     current_retry_delay = retry_delay * (attempt + 1)
-                    logger.info(f"将在{current_retry_delay}秒后重试 ({attempt+1}/{max_retries})")
                     time.sleep(current_retry_delay)
                     continue
                 return
+                
             logger.info(f"成功获取RSS，共找到 {len(feed.entries)} 条帖子")
             last_rss_check_time = datetime.datetime.now()
             last_rss_error = None
@@ -430,10 +437,11 @@ def check_rss_feed(config):
             match_summary = bool(config['settings'].get('match_summary', True))
             regex_match = bool(config['settings'].get('regex_match', False))
             full_word_match = bool(config['settings'].get('full_word_match', False))
-            keywords_clean = [k.strip() for k in config['keywords'] if isinstance(k, str) and k.strip()]
-            exclude_clean = [k.strip() for k in config['exclude_keywords'] if isinstance(k, str) and k.strip()]
-            keywords_lower = [k.lower() for k in keywords_clean]
-            exclude_lower = [k.lower() for k in exclude_clean]
+            
+            # 准备全局排除列表
+            global_exclude = [k.strip().lower() for k in config['exclude_keywords'] if isinstance(k, str) and k.strip()]
+            
+            # 准备正则缓存
             regex_cache = {}
             
             processed_count = 0
@@ -448,8 +456,11 @@ def check_rss_feed(config):
                             summary = entry.summary
                         elif hasattr(entry, 'description') and entry.description:
                             summary = entry.description
+                    
+                    # 清理HTML
                     summary = re.sub(r'<[^>]+>', '', summary or '').strip()
                     summary = re.sub(r'\s+', ' ', summary)
+                    
                     # 提取作者
                     author = ''
                     if hasattr(entry, 'author') and entry.author:
@@ -458,157 +469,154 @@ def check_rss_feed(config):
                         author = entry.author_detail.get('name', '')
                     elif hasattr(entry, 'dc_creator') and entry.dc_creator:
                         author = entry.dc_creator
-                    elif hasattr(entry, 'summary') and entry.summary:
-                        summary_match = re.search(r'作者[：:]\s*([^<\n\r]+)', entry.summary)
-                        if summary_match:
-                            author = summary_match.group(1).strip()
-                    if not author and hasattr(entry, 'tags') and entry.tags:
-                        for tag in entry.tags:
-                            if hasattr(tag, 'term') and '作者' in tag.term:
-                                author = tag.term.replace('作者:', '').replace('作者：', '').strip()
-                                break
+                    
                     if not title or not link:
-                        logger.warning("跳过缺少标题或链接的条目")
                         continue
+                        
                     title = re.sub(r'<[^>]+>', '', title).strip()
                     title = re.sub(r'\s+', ' ', title)
-                    # 清理作者信息中的HTML标签和特殊字符
                     if author:
                         author = re.sub(r'<[^>]+>', '', author).strip()
                         author = re.sub(r'\s+', ' ', author)
                     else:
                         author = '未知'
-                    
-                    logger.debug(f"处理帖子: 标题='{title}', 作者='{author}', 链接={link}")
-                    
-                    # 优先从链接提取稳定的帖子ID，而不是依赖guid
+                        
+                    # 生成ID
                     post_id = None
-                    post_id_patterns = [
-                        r'/post-(\d+)',
-                        r'/post/(\d+)', 
-                        r'/topic/(\d+)',
-                        r'/thread/(\d+)',
-                        r'-(\d+)$'
-                    ]
+                    post_id_patterns = [r'/post-(\d+)', r'/post/(\d+)', r'/topic/(\d+)', r'/thread/(\d+)', r'-(\d+)$']
                     for pattern in post_id_patterns:
                         match = re.search(pattern, link)
                         if match:
                             post_id = match.group(1)
                             break
+                    if not post_id and hasattr(entry, 'guid'):
+                        guid_match = re.search(r'(\d+)', str(entry.guid))
+                        if guid_match: post_id = guid_match.group(1)
                     
-                    # 如果链接中没找到ID，再尝试guid
-                    if not post_id and hasattr(entry, 'guid') and entry.guid:
-                        guid_str = str(entry.guid).strip()
-                        # 从guid中提取数字
-                        guid_match = re.search(r'(\d+)', guid_str)
-                        if guid_match:
-                            post_id = guid_match.group(1)
-                    
-                    # 增强作者名标准化处理
+                    # 生成唯一Key
                     if author and author != '未知':
-                        # 移除所有空白字符（包括中文空格、制表符等）
-                        author_cleaned = re.sub(r'[\s\u3000\u00A0]+', '', author)
-                        # 移除特殊符号和标点
-                        author_cleaned = re.sub(r'[^\w\u4e00-\u9fff]', '', author_cleaned)
-                        # 转为小写
-                        author_normalized = author_cleaned.lower()
+                         author_cleaned = re.sub(r'[\s\u3000\u00A0]+', '', author)
+                         author_cleaned = re.sub(r'[^\w\u4e00-\u9fff]', '', author_cleaned)
+                         author_normalized = author_cleaned.lower()
                     else:
                         author_normalized = 'unknown'
-                    
-                    logger.debug(f"作者名标准化: '{author}' -> '{author_normalized}'")
-                    
-                    # 生成唯一去重key：帖子ID_标准化作者名
+                        
                     if post_id:
                         unique_key = f"{post_id}_{author_normalized}"
                     else:
-                        # 如果没有post_id，使用链接的hash作为ID
                         import hashlib
                         link_hash = hashlib.md5(link.encode()).hexdigest()[:8]
                         unique_key = f"{link_hash}_{author_normalized}"
                     
-                    logger.info(f"生成unique_key: {unique_key} (post_id={post_id}, author='{author}' -> '{author_normalized}')")
-                    
-                    # 只用唯一key做去重
                     if unique_key in config['notified_entries']:
-                        logger.info(f"✅ 跳过已通知过的帖子: {unique_key} 标题='{title}'")
                         continue
-                    # 排除关键词命中则不提醒
+                        
+                    # 构造匹配文本
                     title_lower = title.lower()
                     summary_lower = summary.lower()
-                    def match_one(text, kw, kw_lower):
+                    combined_text = title_lower + (' ' + summary_lower if match_summary and summary_lower else '')
+                    
+                    # 匹配函数
+                    def check_match(text, pattern_str, headers=None):
+                        # pattern_str 已经是 lower 的
                         if regex_match:
                             try:
-                                pattern = regex_cache.get(kw)
-                                if pattern is None:
-                                    pattern = re.compile(kw, re.IGNORECASE)
-                                    regex_cache[kw] = pattern
-                                return pattern.search(text) is not None
-                            except re.error as e:
-                                logger.warning(f"正则关键词 '{kw}' 无效: {e}")
-                                regex_cache[kw] = None
+                                pat = regex_cache.get(pattern_str)
+                                if pat is None:
+                                    pat = re.compile(pattern_str, re.IGNORECASE)
+                                    regex_cache[pattern_str] = pat
+                                return pat.search(text) is not None
+                            except:
                                 return False
                         if full_word_match:
-                            return re.search(rf"\b{re.escape(kw_lower)}\b", text) is not None
-                        return kw_lower in text
-                    
-                    combined_text = title_lower + (' ' + summary_lower if match_summary and summary_lower else '')
-                    excluded_hits = [ek for ek, ek_lower in zip(exclude_clean, exclude_lower) if ek_lower and match_one(combined_text, ek, ek_lower)]
-                    if excluded_hits:
-                        logger.info(f"⛔ 跳过命中排除关键词的帖子: {unique_key} 标题='{title}' 排除: {excluded_hits}")
+                            return re.search(rf"\b{re.escape(pattern_str)}\b", text) is not None
+                        return pattern_str in text
+
+                    # 1. 检查全局排除
+                    hit_global_exclude = False
+                    for ek in global_exclude:
+                        if check_match(combined_text, ek):
+                            hit_global_exclude = True
+                            break
+                    if hit_global_exclude:
                         continue
-                    matched_keywords = [kw for kw, kw_lower in zip(keywords_clean, keywords_lower) if kw_lower and match_one(combined_text, kw, kw_lower)]
-                    if matched_keywords:
+                        
+                    matched_rules = []
+                    
+                    # 2. 遍历所有关键字规则
+                    # config['keywords'] 现在是 [{"word":"xxx", "include":[], "exclude":[]}, ...]
+                    for rule in config['keywords']:
+                        main_kw = rule.get('word', '').strip()
+                        if not main_kw: continue
+                        main_kw_lower = main_kw.lower()
+                        
+                        # A. 必须包含主关键字
+                        if not check_match(combined_text, main_kw_lower):
+                            continue
+                            
+                        # B. 检查局部排除 (Exclude) - 任何命中则跳过
+                        local_exclude = rule.get('exclude', [])
+                        hit_local_exclude = False
+                        for lek in local_exclude:
+                            if not isinstance(lek, str) or not lek.strip(): continue
+                            if check_match(combined_text, lek.strip().lower()):
+                                hit_local_exclude = True
+                                break
+                        if hit_local_exclude:
+                            continue
+                            
+                        # C. 检查局部必含 (Include) - 列表为空则通过，否则需命中至少一个
+                        local_include = rule.get('include', [])
+                        valid_include = [li for li in local_include if isinstance(li, str) and li.strip()]
+                        
+                        if valid_include:
+                            hit_any_include = False
+                            for lik in valid_include:
+                                if check_match(combined_text, lik.strip().lower()):
+                                    hit_any_include = True
+                                    break
+                            if not hit_any_include:
+                                continue # 有必含条件但并未满足
+                                
+                        matched_rules.append(main_kw)
+
+                    # 发送通知
+                    if matched_rules:
                         config['notified_entries'][unique_key] = {
                             'title': title,
                             'author': author,
                             'link': link,
-                            'keywords': matched_keywords,
+                            'keywords': matched_rules,
                             'time': datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                         }
                         config_changed = True
+                        
+                        join_kws = ', '.join(matched_rules)
                         message = (
                             "<b>🎯 发现命中帖子</b>\n"
                             f"• <b>标题</b>：{title}\n"
-                            f"• <b>关键词</b>：{', '.join(matched_keywords)}\n"
+                            f"• <b>匹配规则</b>：{join_kws}\n"
                             f"• <b>作者</b>：{author}\n"
                             f"• <b>链接</b>：{link}"
                         )
                         if send_telegram_message(message, config):
-                            logger.info(f"检测到关键词 '{', '.join(matched_keywords)}' 在帖子 '{title}' (作者: {author}) 并成功发送通知")
+                            logger.info(f"检测到规则 [{join_kws}] 命中: '{title}'")
                         else:
-                            logger.error(f"发送通知失败，帖子标题: {title} (作者: {author})")
                             if unique_key in config['notified_entries']:
                                 del config['notified_entries'][unique_key]
+                                
                 except Exception as e:
-                    logger.error(f"处理RSS条目时出错: {str(e)}")
+                    logger.error(f"处理RSS条目 error: {e}")
                     continue
-            # 限制notified_entries的数量
-            max_notified = int(config['settings'].get('max_notified_entries', DEFAULT_CONFIG['settings']['max_notified_entries']))
-            if max_notified > 0 and len(config['notified_entries']) > max_notified:
-                sorted_entries = sorted(
-                    config['notified_entries'].items(),
-                    key=lambda item: item[1].get('time', '') if isinstance(item[1], dict) else '',
-                    reverse=True
-                )[:max_notified]
-                config['notified_entries'] = dict(sorted_entries)
-                logger.info(f"已限制记录数量为{max_notified}条")
-                config_changed = True
+                    
             if config_changed:
                 save_config(config)
-            return
-        except requests.exceptions.Timeout:
-            last_rss_error = f"获取RSS超时 (尝试 {attempt+1}/{max_retries})"
-            logger.error(last_rss_error)
-        except requests.exceptions.ConnectionError:
-            last_rss_error = f"连接RSS服务器失败 (尝试 {attempt+1}/{max_retries})"
-            logger.error(last_rss_error)
+                
         except Exception as e:
-            last_rss_error = f"检查RSS时出错: {str(e)} (尝试 {attempt+1}/{max_retries})"
+            last_rss_error = f"检查RSS时出错: {str(e)}"
             logger.error(last_rss_error)
-        if attempt < max_retries - 1:
-            current_retry_delay = retry_delay * (attempt + 1)
-            logger.info(f"将在{current_retry_delay}秒后重试 ({attempt+1}/{max_retries})")
-            time.sleep(current_retry_delay)
+            if attempt < max_retries - 1:
+                time.sleep(retry_delay * (attempt + 1))
 
 def restart_program(reason):
     logger.info(f"准备重启程序，原因: {reason}")
@@ -751,58 +759,131 @@ def telegram_command_listener():
 
                 if command == "/add":
                     if not arg:
-                        send_telegram_message("请输入关键词，例如：/add 关键字", config, msg_id)
+                        send_telegram_message(
+                            "<b>格式错误</b>\n"
+                            "请使用：/add 关键字 [clean|clean-i|clean-e] [+必含] [-排除]\n"
+                            "示例：/add mk clean +卖 -吗", 
+                            config, msg_id
+                        )
                         continue
-                    keyword = arg.strip()
-                    key_lower = keyword.lower()
-                    if any(key_lower == k.strip().lower() for k in config['exclude_keywords']):
-                        send_telegram_message(f"⚠️ 关键词 <b>{keyword}</b> 已在排除列表，无法添加到监控列表", config, msg_id)
+                    
+                    # 解析参数
+                    tokens = arg.split()
+                    keyword = tokens[0]
+                    # 解析操作符
+                    flags = [t.lower() for t in tokens[1:] if t.lower() in ('clean', 'clean-i', 'clean-e')]
+                    # 解析包含/排除 (+xxx / -xxx)
+                    includes_new = [t[1:] for t in tokens[1:] if t.startswith('+') and len(t) > 1]
+                    excludes_new = [t[1:] for t in tokens[1:] if t.startswith('-') and len(t) > 1]
+                    
+                    # 检查全局排除
+                    if any(keyword.lower() == k.strip().lower() for k in config['exclude_keywords']):
+                        send_telegram_message(f"⚠️ 关键词 <b>{keyword}</b> 已在全局排除列表，无法添加", config, msg_id)
                         continue
-                    if any(key_lower == k.strip().lower() for k in config['keywords']):
-                        send_telegram_message(f"ℹ️ 关键词 <b>{keyword}</b> 已存在", config, msg_id)
+                        
+                    # 查找现有记录
+                    target_item = None
+                    exists = False
+                    for item in config['keywords']:
+                        if item['word'] == keyword:
+                            target_item = item
+                            exists = True
+                            break
+                    
+                    if not target_item:
+                        target_item = {"word": keyword, "include": [], "exclude": []}
+                        config['keywords'].append(target_item)
+                    
+                    # 处理清理标记
+                    if 'clean' in flags:
+                        target_item['include'] = []
+                        target_item['exclude'] = []
                     else:
-                        config['keywords'].append(keyword)
-                        config['keywords'] = list(dict.fromkeys([k.strip() for k in config['keywords'] if k.strip()]))
-                        save_config(config)
-                        send_telegram_message(f"✅ 已添加关键词：<b>{keyword}</b>", config, msg_id)
+                        if 'clean-i' in flags: target_item['include'] = []
+                        if 'clean-e' in flags: target_item['exclude'] = []
+                        
+                    # 合并新规则 (去重)
+                    for inc in includes_new:
+                        if inc not in target_item['include']:
+                            target_item['include'].append(inc)
+                    for exc in excludes_new:
+                        if exc not in target_item['exclude']:
+                            target_item['exclude'].append(exc)
+                            
+                    save_config(config)
+                    
+                    # 构建反馈消息
+                    info_parts = [f"<b>{keyword}</b>"]
+                    if target_item['include']:
+                        info_parts.append(f"必含: [{', '.join(target_item['include'])}]")
+                    if target_item['exclude']:
+                        info_parts.append(f"排除: [{', '.join(target_item['exclude'])}]")
+                    if not target_item['include'] and not target_item['exclude']:
+                        info_parts.append("(普通匹配)")
+                        
+                    action_str = "更新" if exists else "添加"
+                    send_telegram_message(f"✅ 已{action_str}规则：{' '.join(info_parts)}", config, msg_id)
+
                 elif command == "/del":
                     if not arg:
                         send_telegram_message("请输入要删除的关键词，例如：/del 关键字", config, msg_id)
                         continue
                     keyword = arg.strip()
-                    to_remove = [k for k in config['keywords'] if k.strip().lower() == keyword.lower()]
-                    if to_remove:
-                        for k in to_remove:
-                            config['keywords'].remove(k)
-                        # 只保存keywords变化，不影响notified_entries
+                    # 查找并删除（匹配word字段）
+                    original_len = len(config['keywords'])
+                    config['keywords'] = [k for k in config['keywords'] if k['word'] != keyword]
+                    
+                    if len(config['keywords']) < original_len:
                         save_config(config)
                         send_telegram_message(f"🗑️ 已删除关键词：<b>{keyword}</b>", config, msg_id)
                     else:
                         send_telegram_message(f"❓ 关键词 <b>{keyword}</b> 不存在", config, msg_id)
+                        
                 elif command == "/list":
-                    kw_list = '\n'.join([f"{i+1}. {k}" for i, k in enumerate(config['keywords'])]) if config['keywords'] else "（空）"
+                    if not config['keywords']:
+                        kw_msg = "（空）"
+                    else:
+                        lines = []
+                        for i, item in enumerate(config['keywords']):
+                            # item 是 dict: {"word": "xx", "include": [], "exclude": []}
+                            line = f"{i+1}. <b>{item['word']}</b>"
+                            extras = []
+                            if item.get('include'):
+                                extras.append(f"➕{','.join(item['include'])}")
+                            if item.get('exclude'):
+                                extras.append(f"⛔{','.join(item['exclude'])}")
+                            if extras:
+                                line += f" ({' '.join(extras)})"
+                            lines.append(line)
+                        kw_msg = '\n'.join(lines)
+                        
                     blk_list = '\n'.join([f"{i+1}. {k}" for i, k in enumerate(config['exclude_keywords'])]) if config['exclude_keywords'] else "（空）"
+                    
                     send_telegram_message(
-                        "<b>📌 当前关键词</b>\n"
-                        f"{kw_list}\n\n"
-                        "<b>🚫 排除关键词</b>\n"
+                        "<b>📌 当前监控规则</b>\n"
+                        f"{kw_msg}\n\n"
+                        "<b>🚫 全局排除关键词</b>\n"
                         f"{blk_list}", config, msg_id)
+                        
                 elif command == "/block":
                     if not arg:
                         send_telegram_message("请输入排除关键词，例如：/block 关键字", config, msg_id)
                         continue
                     keyword = arg.strip()
                     key_lower = keyword.lower()
-                    if any(key_lower == k.strip().lower() for k in config['keywords']):
-                        send_telegram_message(f"⚠️ 关键词 <b>{keyword}</b> 已在监控列表，无法加入排除列表", config, msg_id)
+                    # 检查是否在监控列表（检查 word 字段）
+                    if any(key_lower == k['word'].strip().lower() for k in config['keywords']):
+                        send_telegram_message(f"⚠️ 关键词 <b>{keyword}</b> 已在监控列表，无法加入全局排除", config, msg_id)
                         continue
                     if any(key_lower == k.strip().lower() for k in config['exclude_keywords']):
                         send_telegram_message(f"ℹ️ 排除关键词 <b>{keyword}</b> 已存在", config, msg_id)
                     else:
                         config['exclude_keywords'].append(keyword)
+                        # 去重列表
                         config['exclude_keywords'] = list(dict.fromkeys([k.strip() for k in config['exclude_keywords'] if k.strip()]))
                         save_config(config)
-                        send_telegram_message(f"🚫 已添加排除关键词：<b>{keyword}</b>", config, msg_id)
+                        send_telegram_message(f"🚫 已添加全局排除：<b>{keyword}</b>", config, msg_id)
+                        
                 elif command == "/unblock":
                     if not arg:
                         send_telegram_message("请输入要删除的排除关键词，例如：/unblock 关键字", config, msg_id)
@@ -813,15 +894,17 @@ def telegram_command_listener():
                         for k in to_remove:
                             config['exclude_keywords'].remove(k)
                         save_config(config)
-                        send_telegram_message(f"🗑️ 已删除排除关键词：<b>{keyword}</b>", config, msg_id)
+                        send_telegram_message(f"🗑️ 已删除全局排除：<b>{keyword}</b>", config, msg_id)
                     else:
-                        send_telegram_message(f"❓ 排除关键词 <b>{keyword}</b> 不存在", config, msg_id)
+                        send_telegram_message(f"❓ 全局排除关键词 <b>{keyword}</b> 不存在", config, msg_id)
+                        
                 elif command == "/blocklist":
                     if not config['exclude_keywords']:
-                        send_telegram_message("🚫 当前没有设置任何排除关键词", config, msg_id)
+                        send_telegram_message("🚫 当前没有设置任何全局排除关键词", config, msg_id)
                     else:
                         blk_list = '\n'.join([f"{i+1}. {k}" for i, k in enumerate(config['exclude_keywords'])])
-                        send_telegram_message(f"<b>🚫 排除关键词列表</b>\n{blk_list}", config, msg_id)
+                        send_telegram_message(f"<b>🚫 全局排除关键词列表</b>\n{blk_list}", config, msg_id)
+                        
                 elif command == "/setsummary":
                     if not arg:
                         send_telegram_message("请输入 on/off，例如：/setsummary on", config, msg_id)
@@ -833,6 +916,7 @@ def telegram_command_listener():
                     config['settings']['match_summary'] = val
                     save_config(config)
                     send_telegram_message(f"🔎 已{'开启' if val else '关闭'}摘要匹配", config, msg_id)
+                    
                 elif command == "/setfullword":
                     if not arg:
                         send_telegram_message("请输入 on/off，例如：/setfullword on", config, msg_id)
@@ -844,6 +928,7 @@ def telegram_command_listener():
                     config['settings']['full_word_match'] = val
                     save_config(config)
                     send_telegram_message(f"🧩 已{'开启' if val else '关闭'}完整词匹配", config, msg_id)
+                    
                 elif command == "/setregex":
                     if not arg:
                         send_telegram_message("请输入 on/off，例如：/setregex on", config, msg_id)
@@ -854,7 +939,8 @@ def telegram_command_listener():
                         continue
                     config['settings']['regex_match'] = val
                     save_config(config)
-                    send_telegram_message(f"🧠 已{'开启' if val else '关闭'}正则匹配（请确保关键词是合法正则）", config, msg_id)
+                    send_telegram_message(f"🧠 已{'开启' if val else '关闭'}正则匹配", config, msg_id)
+                    
                 elif command == "/setinterval":
                     if not arg:
                         send_telegram_message("请输入两个数字：/setinterval 最小秒 最大秒", config, msg_id)
@@ -871,6 +957,7 @@ def telegram_command_listener():
                     config['settings']['check_max_interval'] = max_v
                     save_config(config)
                     send_telegram_message(f"⏱️ 检测间隔已更新为 <b>{min_v}-{max_v}</b> 秒", config, msg_id)
+                    
                 elif command == "/setnotifylimit":
                     if not arg or not arg.isdigit():
                         send_telegram_message("请输入数字：/setnotifylimit 50（0 表示不限制）", config, msg_id)
@@ -879,23 +966,25 @@ def telegram_command_listener():
                     config['settings']['max_notified_entries'] = limit
                     save_config(config)
                     send_telegram_message(f"📦 通知去重上限已设置为 <b>{limit}</b>", config, msg_id)
+                    
                 elif command == "/status":
                     mem_mb = psutil.Process(os.getpid()).memory_info().rss / 1024 / 1024
                     last_check = last_rss_check_time.strftime('%Y-%m-%d %H:%M:%S') if last_rss_check_time else "无记录"
                     last_err = last_rss_error or "无"
                     interval_info = f"{settings.get('check_min_interval', 0)}-{settings.get('check_max_interval', 0)} 秒"
-                    match_info = f"摘要匹配={'开' if settings.get('match_summary', True) else '关'}，完整词匹配={'开' if settings.get('full_word_match', False) else '关'}，正则匹配={'开' if settings.get('regex_match', False) else '关'}"
-                    # 自动重启策略描述
+                    match_info = f"摘要匹配={'开' if settings.get('match_summary', True) else '关'}，完整词={'开' if settings.get('full_word_match', False) else '关'}，正则={'开' if settings.get('regex_match', False) else '关'}"
+                    
                     total_mem_mb = psutil.virtual_memory().total / 1024 / 1024
                     auto_mem_threshold_mb = min(max(400, total_mem_mb * 0.3), 2000)
                     restart_info = (
                         f"自动重启：内存>{auto_mem_threshold_mb:.0f}MB 或运行>24小时 或连续错误>=15"
                     )
+                    
                     msg = (
                         "<b>📊 运行状态</b>\n"
                         f"• 运行时长：{format_uptime()}\n"
                         f"• 内存占用：{mem_mb:.1f} MB\n"
-                        f"• 关键词：{len(config['keywords'])} 个，排除：{len(config['exclude_keywords'])} 个\n"
+                        f"• 关键词：{len(config['keywords'])} 个，全局排除：{len(config['exclude_keywords'])} 个\n"
                         f"• 上次RSS成功：{last_check}\n"
                         f"• 上次错误：{last_err}\n"
                         f"• 检测间隔：{interval_info}\n"
@@ -904,29 +993,31 @@ def telegram_command_listener():
                         f"• 已完成检测：{detection_counter_state}"
                     )
                     send_telegram_message(msg, config, msg_id)
+                    
                 elif command == "/help" or command == "/start":
                     help_msg = (
-                        "<b>🛠️ 指令列表</b>\n"
-                        "/add 关键字 - 添加关键词\n"
+                        "<b>🛠️ 指令列表（升级版）</b>\n"
+                        "/add 关键字 [clean/-i/-e] [+包含] [-排除]\n"
+                        "  └─ 示例: /add mk +出 -吗\n"
+                        "  └─ 覆盖: /add mk clean +卖\n"
                         "/del 关键字 - 删除关键词\n"
-                        "/list - 查看关键词与排除列表\n"
-                        "/block 关键字 - 添加排除关键词\n"
-                        "/unblock 关键字 - 删除排除关键词\n"
-                        "/blocklist - 查看排除列表\n"
+                        "/list - 查看详细规则列表\n"
+                        "/block 关键字 - 全局屏蔽\n"
+                        "/unblock 关键字 - 取消全局屏蔽\n"
+                        "/blocklist - 查看全局屏蔽列表\n"
                         "/setsummary on/off - 摘要匹配\n"
                         "/setfullword on/off - 完整词匹配\n"
                         "/setregex on/off - 正则匹配\n"
-                        "/setinterval min max - 设置检测间隔秒\n"
-                        "/setnotifylimit N - 设置通知去重上限\n"
-                        "/status - 查看运行状态\n"
-                        "/help - 查看帮助"
+                        "/setinterval min max - 设置间隔\n"
+                        "/setnotifylimit N - 设置上限\n"
+                        "/status - 状态\n"
                     )
                     send_telegram_message(help_msg, config, msg_id)
             time.sleep(2)
         except Exception as e:
             logger.error(f"Telegram指令监听异常: {e}")
             time.sleep(5)
-
+            
 def init_config_from_env():
     """从环境变量初始化配置"""
     config = load_config()
