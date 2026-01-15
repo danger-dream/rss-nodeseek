@@ -22,7 +22,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # 复制应用程序文件
-COPY rss_main.py .
+COPY index.py .
 
 # 创建数据目录
 RUN mkdir -p /data
@@ -31,9 +31,10 @@ RUN mkdir -p /data
 VOLUME ["/data"]
 
 # 设置默认命令
-CMD ["python", "rss_main.py"]
+CMD ["python", "index.py"]
 
 # 添加标签
 LABEL maintainer="RSS Monitor Team" \
       description="RSS监控程序 - 监控RSS源并通过Telegram发送通知" \
+
       version="1.0" 
