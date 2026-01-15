@@ -416,13 +416,13 @@ def telegram_command_listener():
                         send_telegram_message("⛔ 只有管理员可以使用此命令", bot_token, chat_id, msg_id)
                         continue
                     parts = args_str.split()
-					if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
-						config['system']['check_min_interval'] = int(parts[0])
-						config['system']['check_max_interval'] = int(parts[1])
-						save_main_config(config)
-						send_telegram_message(f"⏱️ 间隔已设为 {parts[0]}-{parts[1]}秒", bot_token, chat_id, msg_id)
-					else:
-						send_telegram_message("❌ 格式: /setinterval 30 60", bot_token, chat_id, msg_id)
+                    if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
+                        config['system']['check_min_interval'] = int(parts[0])
+                        config['system']['check_max_interval'] = int(parts[1])
+                        save_main_config(config)
+                        send_telegram_message(f"⏱️ 间隔已设为 {parts[0]}-{parts[1]}秒", bot_token, chat_id, msg_id)
+                    else:
+                        send_telegram_message("❌ 格式: /setinterval 30 60", bot_token, chat_id, msg_id)
 
                 elif cmd_raw in ("/help", "/start"):
                     is_admin = (chat_id == os.environ.get('TG_CHAT_ID', '').strip())
