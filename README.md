@@ -29,10 +29,6 @@ export TG_CHAT_ID=your_chat_id
 python3 index.py
 ```
 
-## Telegram 指令
-
-所有指令支持 BotFather 菜单补全。
-
 ### Docker 运行
 
 1. 准备 `.env`（示例）:
@@ -49,6 +45,10 @@ python3 index.py
 1. 准备 `.env` 同上，并确保 `docker-compose.yml` 存在（已提供）。
 2. 启动：`docker compose up -d`
 3. 查看日志：`docker compose logs -f`
+
+## Telegram 指令
+
+所有指令支持 BotFather 菜单补全。
 
 ### 规则管理
 
