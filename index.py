@@ -548,7 +548,6 @@ def check_rss_feed():
         if not bot_token: return
 
         regex_cache = {}
-        processed_changed = False
 
         for entry in feed.entries:
             link = getattr(entry, 'link', '').strip()
@@ -556,10 +555,17 @@ def check_rss_feed():
             if hasattr(entry, 'id') and entry.id: key = entry.id
             else: key = hashlib.md5(link.encode()).hexdigest()
 
-            # 快速跳过已处理的条目
+            # 原子去重：检查并立即占位，避免发送阶段出现重复推送窗口
+            reserved = False
             with config_lock:
                 if key in processed_ids:
                     continue
+                processed_ids.add(key)
+                reserved = True
+
+            # 尽快落盘，降低进程异常退出导致的重复通知窗口
+            if reserved:
+                save_processed()
 
             title = getattr(entry, 'title', '').strip()
             summary = getattr(entry, 'summary', '') or getattr(entry, 'description', '')
@@ -570,7 +576,7 @@ def check_rss_feed():
             title = clean_html(title)
             summary = clean_html(summary)
             author = clean_html(author)
-            
+
             pub_date_str = ""
             try:
                 if hasattr(entry, 'published_parsed') and entry.published_parsed:
@@ -583,7 +589,11 @@ def check_rss_feed():
                     pub_date_str = dt_bj.strftime('%Y-%m-%d %H:%M:%S')
             except Exception as e:
                 logger.debug(f"解析发布时间失败: {e}")
-            
+
+            # 跟踪本条目发送结果，用于失败回滚
+            send_attempts = 0
+            send_success = 0
+
             # 遍历所有用户进行匹配
             with config_lock:
                 users_copy = copy.deepcopy(global_config['users'])
@@ -594,29 +604,29 @@ def check_rss_feed():
                 match_summary = settings.get('match_summary', False)
                 full_word = settings.get('full_word_match', False)
                 use_regex = settings.get('regex_match', False)
-                
+
                 text_to_check = title.lower()
                 if match_summary: text_to_check += " " + summary.lower()
-                
+
                 is_blocked = False
                 for block in user_conf.get('global_exclude', []):
                     if check_match(text_to_check, block.lower(), False, use_regex, regex_cache):
                         is_blocked = True
                         break
                 if is_blocked: continue
-                
+
                 matched_rules = []
                 for rule in keywords:
                     base = rule['word'].lower()
                     if not check_match(text_to_check, base, full_word, use_regex, regex_cache): continue
-                    
+
                     hit_ex = False
                     for ex in rule.get('exclude', []):
                         if check_match(text_to_check, ex.lower(), False, use_regex, regex_cache):
                             hit_ex = True
                             break
                     if hit_ex: continue
-                    
+
                     includes = rule.get('include', [])
                     if includes:
                         hit_in = False
@@ -626,8 +636,9 @@ def check_rss_feed():
                                 break
                         if not hit_in: continue
                     matched_rules.append(rule['word'])
-                
+
                 if matched_rules:
+                    send_attempts += 1
                     kws_str = ", ".join(matched_rules)
                     msg = (
                         f"<b>🎯 发现命中帖子</b>\n"
@@ -638,16 +649,18 @@ def check_rss_feed():
                         f"• <b>链接</b>：{link}"
                     )
                     if send_telegram_message(msg, bot_token, chat_id):
+                        send_success += 1
                         logger.info(f"向用户 {chat_id} 推送: {title} (规则: {kws_str})")
-            
-            # 标记为已处理
-            with config_lock:
-                if key not in processed_ids:
-                    processed_ids.add(key)
-                    processed_changed = True
+                    else:
+                        logger.warning(f"向用户 {chat_id} 推送失败: {title} (规则: {kws_str})")
 
-        # 颗粒化保存
-        if processed_changed: save_processed()
+            # 命中但全部发送失败：回滚去重标记，允许下轮重试，避免丢消息
+            if send_attempts > 0 and send_success == 0:
+                with config_lock:
+                    if key in processed_ids:
+                        processed_ids.remove(key)
+                save_processed()
+                logger.warning(f"条目全部推送失败，已回滚去重标记等待重试: {key}")
             
     except Exception as e:
         last_rss_error = str(e)
